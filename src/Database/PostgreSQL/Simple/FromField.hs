@@ -541,7 +541,7 @@ instance (FromField a, Typeable a) => FromField (IOVector a) where
 -- | uuid
 instance FromField UUID where
     fromField f mbs =
-      if typeOid f /= typoid TI.uuid
+      if typeOid f /= TI.uuidOid
       then returnError Incompatible f ""
       else case mbs of
              Nothing -> returnError UnexpectedNull f ""
@@ -560,7 +560,7 @@ instance FromField JSON.Value where
 -- | Return the JSON ByteString directly
 fromFieldJSONByteString :: Field -> Maybe ByteString -> Conversion ByteString
 fromFieldJSONByteString f mbs =
-      if typeOid f /= typoid TI.json && typeOid f /= typoid TI.jsonb
+      if typeOid f /= TI.jsonOid && typeOid f /= TI.jsonbOid
       then returnError Incompatible f ""
       else case mbs of
              Nothing -> returnError UnexpectedNull f ""
