@@ -1,6 +1,10 @@
-{-# LANGUAGE  CPP, BangPatterns, DoAndIfThenElse, RecordWildCards  #-}
-{-# LANGUAGE  DeriveDataTypeable, DeriveGeneric                    #-}
-{-# LANGUAGE  GeneralizedNewtypeDeriving                           #-}
+{-# LANGUAGE BangPatterns               #-}
+{-# LANGUAGE CPP                        #-}
+{-# LANGUAGE DeriveDataTypeable         #-}
+{-# LANGUAGE DeriveGeneric              #-}
+{-# LANGUAGE DoAndIfThenElse            #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE RecordWildCards            #-}
 
 ------------------------------------------------------------------------------
 -- |
@@ -21,41 +25,44 @@
 
 module Database.PostgreSQL.Simple.Internal where
 
-import           Control.Applicative
-import           Control.Exception
-import           Control.Concurrent.MVar
-import           Control.Monad(MonadPlus(..))
-import           Data.ByteString(ByteString)
+import Control.Applicative
+import Control.Concurrent.MVar
+import Control.Exception
+import Control.Monad (MonadPlus (..))
+import Control.Monad.Trans.Class
+import Control.Monad.Trans.Reader
+import Control.Monad.Trans.State.Strict
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import Data.ByteString.Builder (Builder, byteString)
 import qualified Data.ByteString.Char8 as B8
-import           Data.ByteString.Builder ( Builder, byteString )
-import           Data.Char (ord)
-import           Data.Int (Int64)
+import Data.Char (ord)
+import Data.Int (Int64)
 import qualified Data.IntMap as IntMap
-import           Data.IORef
-import           Data.Maybe(fromMaybe)
-import           Data.Monoid
-import           Data.String
+import Data.IORef
+import Data.Maybe (fromMaybe)
+import Data.Monoid
+import Data.String
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import           Data.Typeable
-import           Data.Word
-import           Database.PostgreSQL.LibPQ(Oid(..))
+import Data.Typeable
+import Data.Word
+import Database.PostgreSQL.LibPQ (Oid (..))
+import Database.PostgreSQL.LibPQ (ExecStatus (..))
 import qualified Database.PostgreSQL.LibPQ as PQ
-import           Database.PostgreSQL.LibPQ(ExecStatus(..))
-import           Database.PostgreSQL.Simple.Compat ( toByteString )
-import           Database.PostgreSQL.Simple.Ok
-import           Database.PostgreSQL.Simple.ToField (Action(..), inQuotes)
-import           Database.PostgreSQL.Simple.Types (Query(..))
-import           Database.PostgreSQL.Simple.TypeInfo.Types(TypeInfo)
-import           Control.Monad.Trans.State.Strict
-import           Control.Monad.Trans.Reader
-import           Control.Monad.Trans.Class
-import           GHC.Generics
-import           GHC.IO.Exception
+import Database.PostgreSQL.Simple.Compat (toByteString)
+import Database.PostgreSQL.Simple.Ok
+import Database.PostgreSQL.Simple.ToField (Action (..), inQuotes)
+import Database.PostgreSQL.Simple.TypeInfo.Types (TypeInfo)
+import Database.PostgreSQL.Simple.Types (Query (..))
+import GHC.Generics
+import GHC.IO.Exception
 #if !defined(mingw32_HOST_OS)
-import           Control.Concurrent(threadWaitRead, threadWaitWrite)
+import Control.Concurrent (threadWaitRead, threadWaitWrite)
 #endif
+
+import Control.Exception (onException)
+import Debug.Trace (traceM)
 
 -- | A Field represents metadata about a particular field
 --
@@ -64,9 +71,9 @@ import           Control.Concurrent(threadWaitRead, threadWaitWrite)
 -- just the field metadata
 
 data Field = Field {
-     result   :: !PQ.Result
-   , column   :: {-# UNPACK #-} !PQ.Column
-   , typeOid  :: {-# UNPACK #-} !PQ.Oid
+     result  :: !PQ.Result
+   , column  :: {-# UNPACK #-} !PQ.Column
+   , typeOid :: {-# UNPACK #-} !PQ.Oid
      -- ^ This returns the type oid associated with the column.  Analogous
      --   to libpq's @PQftype@.
    }
@@ -74,8 +81,8 @@ data Field = Field {
 type TypeInfoCache = IntMap.IntMap TypeInfo
 
 data Connection = Connection {
-     connectionHandle  :: {-# UNPACK #-} !(MVar PQ.Connection)
-   , connectionObjects :: {-# UNPACK #-} !(MVar TypeInfoCache)
+     connectionHandle          :: {-# UNPACK #-} !(MVar PQ.Connection)
+   , connectionObjects         :: {-# UNPACK #-} !(MVar TypeInfoCache)
    , connectionTempNameCounter :: {-# UNPACK #-} !(IORef Int64)
    } deriving (Typeable)
 
@@ -99,7 +106,7 @@ instance Exception SqlError
 -- operation, or 'execute' is used to perform a @SELECT@-like operation.
 data QueryError = QueryError {
       qeMessage :: String
-    , qeQuery :: Query
+    , qeQuery   :: Query
     } deriving (Eq, Show, Typeable)
 
 instance Exception QueryError
@@ -109,16 +116,16 @@ instance Exception QueryError
 -- string does not match the number of parameters provided.
 data FormatError = FormatError {
       fmtMessage :: String
-    , fmtQuery :: Query
-    , fmtParams :: [ByteString]
+    , fmtQuery   :: Query
+    , fmtParams  :: [ByteString]
     } deriving (Eq, Show, Typeable)
 
 instance Exception FormatError
 
 data ConnectInfo = ConnectInfo {
-      connectHost :: String
-    , connectPort :: Word16
-    , connectUser :: String
+      connectHost     :: String
+    , connectPort     :: Word16
+    , connectUser     :: String
     , connectPassword :: String
     , connectDatabase :: String
     } deriving (Generic,Eq,Read,Show,Typeable)
@@ -228,6 +235,7 @@ connect = connectPostgreSQL . postgreSQLConnectionString
 connectPostgreSQL :: ByteString -> IO Connection
 connectPostgreSQL connstr = do
     conn <- connectdb connstr
+        `onException` traceM "connectdb threw"
     stat <- PQ.status conn
     case stat of
       PQ.ConnectionOk -> do
@@ -250,12 +258,16 @@ connectdb :: ByteString -> IO PQ.Connection
 connectdb = PQ.connectdb
 #else
 connectdb conninfo = do
+    traceM "Doing connect"
     conn <- PQ.connectStart conninfo
+    traceM "Connection established"
     loop conn
   where
     funcName = "Database.PostgreSQL.Simple.connectPostgreSQL"
     loop conn = do
+      traceM "Polling connection"
       status <- PQ.connectPoll conn
+      traceM $ "Polled something: " <> show status
       case status of
         PQ.PollingFailed  -> throwLibPQError conn "connection failed"
         PQ.PollingReading -> do
@@ -449,8 +461,8 @@ newNullConnection = do
     return Connection{..}
 
 data Row = Row {
-     row        :: {-# UNPACK #-} !PQ.Row
-   , rowresult  :: !PQ.Result
+     row       :: {-# UNPACK #-} !PQ.Row
+   , rowresult :: !PQ.Result
    }
 
 newtype RowParser a = RP { unRP :: ReaderT Row (StateT PQ.Column Conversion) a }
@@ -472,7 +484,7 @@ instance Applicative Conversion where
    mf <*> ma = Conversion $ \conn -> do
                    okf <- runConversion mf conn
                    case okf of
-                     Ok f -> (fmap . fmap) f (runConversion ma conn)
+                     Ok f        -> (fmap . fmap) f (runConversion ma conn)
                      Errors errs -> return (Errors errs)
 
 instance Alternative Conversion where
@@ -490,7 +502,7 @@ instance Monad Conversion where
    m >>= f = Conversion $ \conn -> do
                  oka <- runConversion m conn
                  case oka of
-                   Ok a -> runConversion (f a) conn
+                   Ok a       -> runConversion (f a) conn
                    Errors err -> return (Errors err)
 
 instance MonadPlus Conversion where
@@ -533,8 +545,13 @@ libPQError desc = IOError {
 
 throwLibPQError :: PQ.Connection -> ByteString -> IO a
 throwLibPQError conn default_desc = do
+  traceM "Throwing error"
   msg <- maybe default_desc id <$> PQ.errorMessage conn
-  throwIO $! libPQError msg
+  traceM "Made error message"
+  let !_ = msg
+  traceM "Forced, throwing"
+  throwIO (libPQError msg)
+      `onException` traceM "Threw error"
 
 
 fmtError :: String -> Query -> [Action] -> a
